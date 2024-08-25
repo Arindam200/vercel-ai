@@ -10,10 +10,10 @@ import { createResolvablePromise } from '../../util/create-resolvable-promise';
 import { retryWithExponentialBackoff } from '../../util/retry-with-exponential-backoff';
 import { CallSettings } from '../prompt/call-settings';
 import { convertToLanguageModelPrompt } from '../prompt/convert-to-language-model-prompt';
-import { getValidatedPrompt } from '../prompt/get-validated-prompt';
 import { prepareCallSettings } from '../prompt/prepare-call-settings';
 import { prepareToolsAndToolChoice } from '../prompt/prepare-tools-and-tool-choice';
 import { Prompt } from '../prompt/prompt';
+import { validatePrompt } from '../prompt/validate-prompt';
 import { assembleOperationName } from '../telemetry/assemble-operation-name';
 import { getBaseTelemetryAttributes } from '../telemetry/get-base-telemetry-attributes';
 import { getTracer } from '../telemetry/get-tracer';
@@ -195,7 +195,7 @@ results that can be fully encapsulated in the provider.
    */
       readonly experimental_providerMetadata: ProviderMetadata | undefined;
     }) => Promise<void> | void;
-  }): Promise<DefaultStreamTextResult<TOOLS>> {
+  }): Promise<StreamTextResult<TOOLS>> {
   const baseTelemetryAttributes = getBaseTelemetryAttributes({
     model,
     telemetry,
@@ -210,7 +210,7 @@ results that can be fully encapsulated in the provider.
     attributes: selectTelemetryAttributes({
       telemetry,
       attributes: {
-        ...assembleOperationName({ operationName: 'ai.streamText', telemetry }),
+        ...assembleOperationName({ operationId: 'ai.streamText', telemetry }),
         ...baseTelemetryAttributes,
         // specific settings that only make sense on the outer level:
         'ai.prompt': {
@@ -222,7 +222,7 @@ results that can be fully encapsulated in the provider.
     endWhenDone: false,
     fn: async rootSpan => {
       const retry = retryWithExponentialBackoff({ maxRetries });
-      const validatedPrompt = getValidatedPrompt({ system, prompt, messages });
+      const validatedPrompt = validatePrompt({ system, prompt, messages });
       const promptMessages = await convertToLanguageModelPrompt({
         prompt: validatedPrompt,
         modelSupportsImageUrls: model.supportsImageUrls,
@@ -231,6 +231,7 @@ results that can be fully encapsulated in the provider.
       const {
         result: { stream, warnings, rawResponse },
         doStreamSpan,
+        startTimestamp,
       } = await retry(() =>
         recordSpan({
           name: 'ai.streamText.doStream',
@@ -238,7 +239,7 @@ results that can be fully encapsulated in the provider.
             telemetry,
             attributes: {
               ...assembleOperationName({
-                operationName: 'ai.streamText.doStream',
+                operationId: 'ai.streamText.doStream',
                 telemetry,
               }),
               ...baseTelemetryAttributes,
@@ -259,22 +260,21 @@ results that can be fully encapsulated in the provider.
           }),
           tracer,
           endWhenDone: false,
-          fn: async doStreamSpan => {
-            return {
-              result: await model.doStream({
-                mode: {
-                  type: 'regular',
-                  ...prepareToolsAndToolChoice({ tools, toolChoice }),
-                },
-                ...prepareCallSettings(settings),
-                inputFormat: validatedPrompt.type,
-                prompt: promptMessages,
-                abortSignal,
-                headers,
-              }),
-              doStreamSpan,
-            };
-          },
+          fn: async doStreamSpan => ({
+            startTimestamp: performance.now(), // get before the call
+            doStreamSpan,
+            result: await model.doStream({
+              mode: {
+                type: 'regular',
+                ...prepareToolsAndToolChoice({ tools, toolChoice }),
+              },
+              ...prepareCallSettings(settings),
+              inputFormat: validatedPrompt.type,
+              prompt: promptMessages,
+              abortSignal,
+              headers,
+            }),
+          }),
         }),
       );
 
@@ -293,6 +293,7 @@ results that can be fully encapsulated in the provider.
         rootSpan,
         doStreamSpan,
         telemetry,
+        startTimestamp,
       });
     },
   });
@@ -321,6 +322,7 @@ class DefaultStreamTextResult<TOOLS extends Record<string, CoreTool>>
     rootSpan,
     doStreamSpan,
     telemetry,
+    startTimestamp,
   }: {
     stream: ReadableStream<TextStreamPart<TOOLS>>;
     warnings: StreamTextResult<TOOLS>['warnings'];
@@ -330,6 +332,7 @@ class DefaultStreamTextResult<TOOLS extends Record<string, CoreTool>>
     rootSpan: Span;
     doStreamSpan: Span;
     telemetry: TelemetrySettings | undefined;
+    startTimestamp: number; // performance.now() timestamp
   }) {
     this.warnings = warnings;
     this.rawResponse = rawResponse;
@@ -379,10 +382,19 @@ class DefaultStreamTextResult<TOOLS extends Record<string, CoreTool>>
     this.originalStream = stream.pipeThrough(
       new TransformStream<TextStreamPart<TOOLS>, TextStreamPart<TOOLS>>({
         async transform(chunk, controller): Promise<void> {
-          // Telemetry event for first chunk:
+          // Telemetry for first chunk:
           if (firstChunk) {
+            const msToFirstChunk = performance.now() - startTimestamp;
+
             firstChunk = false;
-            doStreamSpan.addEvent('ai.stream.firstChunk');
+
+            doStreamSpan.addEvent('ai.stream.firstChunk', {
+              'ai.stream.msToFirstChunk': msToFirstChunk,
+            });
+
+            doStreamSpan.setAttributes({
+              'ai.stream.msToFirstChunk': msToFirstChunk,
+            });
           }
 
           // Filter out empty text deltas
